@@ -31,13 +31,23 @@ def is_authorized(user_id: int) -> bool:
 def download_media(url: str, output_path: str) -> dict:
     """دانلود مدیا با yt-dlp (اجرا در ترد جداگانه)"""
     ydl_opts = {
-        # انتخاب کیفیتی که حجم فایل نهایی برای ربات تلگرام مناسب باشد
+        # انتخاب کیفیت مناسب و سازگار با تلگرام
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': os.path.join(output_path, '%(id)s.%(ext)s'),
         'merge_output_format': 'mp4',
         'quiet': True,
         'no_warnings': True,
+        # شبیه‌سازی کلاینت‌های مختلف برای دور زدن محدودیت‌ها و ربات‌یاب‌های یوتیوب
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android', 'web']
+            }
+        },
     }
+
+    # در صورت وجود فایل کوکی (برای حل قطعی بلاک آی‌پی‌های سرورها)
+    if os.path.exists("cookies.txt"):
+        ydl_opts['cookiefile'] = 'cookies.txt'
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -100,8 +110,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.delete()
 
     except Exception as e:
-        logging.error(f"Error downloading {url}: {e}")
-        await status_msg.edit_text("❌ در دریافت یا ارسال فایل خطایی رخ داد.")
+        logging.error(f"Error downloading {url}: {e}", exc_info=True)
+        await status_msg.edit_text(f"❌ در دریافت یا ارسال فایل خطایی رخ داد:\n`{str(e)[:100]}`", parse_mode="Markdown")
 
     finally:
         # حذف فایل دانلود شده برای پر نشدن حافظه سرور
@@ -113,6 +123,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
+    if not BOT_TOKEN:
+        raise ValueError("BOT_TOKEN یافت نشد! لطفاً در متغیرهای محیطی آن را تنظیم کنید.")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
