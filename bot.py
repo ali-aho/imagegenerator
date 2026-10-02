@@ -1,20 +1,18 @@
 import os
+import time
 import asyncio
 import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 import yt_dlp
 
-# لاگ برای پیگیری وضعیت و خطاها
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-# تنظیمات اصلی
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# لیست آیدی‌های عددی تلگرام افراد مجاز (User ID عددی نه یوزرنیم)
 ALLOWED_USERS = [
     7037339290
 ]
@@ -24,20 +22,77 @@ os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
 def is_authorized(user_id: int) -> bool:
-    """بررسی دسترسی کاربر به ربات"""
     return user_id in ALLOWED_USERS
 
 
-def download_media(url: str, output_path: str) -> dict:
-    """دانلود مدیا با yt-dlp (اجرا در ترد جداگانه)"""
+class LiveProgressLogger:
+    """کلاس ثبت لاگ زنده و ارسال پروگرس به تلگرام"""
+    def __init__(self, loop, status_msg):
+        self.loop = loop
+        self.status_msg = status_msg
+        self.last_update_time = 0
+        self.last_text = ""
+
+    def update_text_sync(self, text: str):
+        # جلوگیری از اسپم ادیت پیام و بلاک شدن توسط تلگرام (حداقل فاصله ۱.۵ ثانیه)
+        now = time.time()
+        if now - self.last_update_time > 1.5 and text != self.last_text:
+            self.last_update_time = now
+            self.last_text = text
+            asyncio.run_coroutine_threadsafe(
+                self._safe_edit(text),
+                self.loop
+            )
+
+    async def _safe_edit(self, text: str):
+        try:
+            await self.status_msg.edit_text(text, parse_mode="Markdown")
+        except Exception:
+            pass
+
+    def debug(self, msg):
+        logging.debug(msg)
+
+    def info(self, msg):
+        logging.info(msg)
+        if any(keyword in msg.lower() for keyword in ["extracting", "downloading", "merging"]):
+            self.update_text_sync(f"ℹ️ *وضعیت:* `{msg[:80]}`")
+
+    def warning(self, msg):
+        logging.warning(msg)
+
+    def error(self, msg):
+        logging.error(msg)
+
+
+def download_media(url: str, output_path: str, progress_logger: LiveProgressLogger) -> dict:
+    """دانلود مدیا با هوک لایو درصد دانلود"""
+    
+    def ytdl_hook(d):
+        if d['status'] == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            downloaded = d.get('downloaded_bytes', 0)
+            percent = (downloaded / total * 100) if total > 0 else 0
+            speed = d.get('speed', 0) or 0
+            speed_mb = speed / (1024 * 1024)
+
+            text = (
+                f"📥 *در حال دانلود فایل:*\n"
+                f"📊 پیشرفت: `{percent:.1f}%`\n"
+                f"⚡ سرعت: `{speed_mb:.2f} MB/s`"
+            )
+            progress_logger.update_text_sync(text)
+        elif d['status'] == 'finished':
+            progress_logger.update_text_sync("⚙️ دانلود تمام شد. در حال ادغام صوت و تصویر...")
+
     ydl_opts = {
-        # انتخاب کیفیت مناسب و سازگار با تلگرام
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': os.path.join(output_path, '%(id)s.%(ext)s'),
         'merge_output_format': 'mp4',
-        'quiet': True,
-        'no_warnings': True,
-        # شبیه‌سازی کلاینت‌های مختلف برای دور زدن محدودیت‌ها و ربات‌یاب‌های یوتیوب
+        'quiet': False,
+        'no_warnings': False,
+        'logger': progress_logger,
+        'progress_hooks': [ytdl_hook],
         'extractor_args': {
             'youtube': {
                 'player_client': ['ios', 'android', 'web']
@@ -45,14 +100,12 @@ def download_media(url: str, output_path: str) -> dict:
         },
     }
 
-    # در صورت وجود فایل کوکی (برای حل قطعی بلاک آی‌پی‌های سرورها)
     if os.path.exists("cookies.txt"):
         ydl_opts['cookiefile'] = 'cookies.txt'
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        # در صورت تبدیل فرمت به mp4 نام نهایی را بررسی می‌کنیم
         base, _ = os.path.splitext(filename)
         final_file = f"{base}.mp4"
         if not os.path.exists(final_file):
@@ -67,7 +120,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "👋 سلام! لینک ویدیو یا صوت رو از هر سایتی (یوتیوب، اینستاگرام، تیک‌تاک و ...) بفرست تا برات دانلود و ارسال کنم."
+        "👋 سلام! لینک ویدیو رو بفرست تا زنده وضعیت دانلودش رو بهت نشون بدم."
     )
 
 
@@ -82,16 +135,17 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("لطفاً یک لینک معتبر اینترنتی ارسال کنید.")
         return
 
-    status_msg = await update.message.reply_text("⏳ در حال پردازش و دانلود مدیا...")
+    status_msg = await update.message.reply_text("🔍 در حال بررسی لینک و استخراج مشخصات...")
+
+    loop = asyncio.get_running_loop()
+    progress_logger = LiveProgressLogger(loop, status_msg)
 
     filepath = None
     try:
-        # اجرای عملیات سنگین دانلود در بک‌گراند بدون بلاک کردن ربات
-        result = await asyncio.to_thread(download_media, url, DOWNLOAD_DIR)
+        result = await asyncio.to_thread(download_media, url, DOWNLOAD_DIR, progress_logger)
         filepath = result["filepath"]
         title = result["title"]
 
-        # بررسی محدودیت حجم تلگرام (حداکثر ۵۰ مگابایت برای بات استاندارد)
         file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
         if file_size_mb > 50:
             await status_msg.edit_text(
@@ -110,11 +164,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.delete()
 
     except Exception as e:
-        logging.error(f"Error downloading {url}: {e}", exc_info=True)
-        await status_msg.edit_text(f"❌ در دریافت یا ارسال فایل خطایی رخ داد:\n`{str(e)[:100]}`", parse_mode="Markdown")
+        error_detail = str(e)
+        logging.error(f"Error downloading {url}: {error_detail}", exc_info=True)
+        # نمایش خطای دقیق ترمینال روی پیام تلگرام برای خطایابی
+        await status_msg.edit_text(
+            f"❌ *خطا در پردازش ویدیو:*\n\n```\n{error_detail[:600]}\n```",
+            parse_mode="Markdown"
+        )
 
     finally:
-        # حذف فایل دانلود شده برای پر نشدن حافظه سرور
         if filepath and os.path.exists(filepath):
             try:
                 os.remove(filepath)
@@ -127,9 +185,8 @@ if __name__ == "__main__":
         raise ValueError("BOT_TOKEN یافت نشد! لطفاً در متغیرهای محیطی آن را تنظیم کنید.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
 
-    print("ربات دانلودر آماده به کار است...")
+    print("ربات دانلودر همراه با سیستم لاگ زنده فعال شد...")
     app.run_polling()
